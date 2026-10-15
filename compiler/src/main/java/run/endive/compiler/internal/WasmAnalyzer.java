@@ -256,7 +256,7 @@ final class WasmAnalyzer {
 
         HashMap<Integer, TryCatchBlock> tryCatchBlocks = new HashMap<>();
 
-        for (int idx = body.instructions().size() - 1; idx >= 0; idx--) {
+        for (int idx = endIndex - 1; idx >= firstIndex; idx--) {
             AnnotatedInstruction ins = body.instructions().get(idx);
 
             if (ins.labelTrue() != AnnotatedInstruction.UNDEFINED_LABEL) {
@@ -295,6 +295,19 @@ final class WasmAnalyzer {
         // implicit block for the function
         stack.enterScope(FUNCTION_SCOPE, FunctionType.of(List.of(), functionType.returns()));
 
+        Map<MethodSplit.Segment, Integer> callLabels = new HashMap<>();
+        if (split != null) {
+            for (var chain : split.chains()) {
+                labels.add(chain.ends[chain.arms()]);
+            }
+        }
+        if (segment != null && segment.isArms()) {
+            for (int end : segment.chain.ends) {
+                labels.add(end);
+            }
+            nextLabel = enterArms(result, segment, nextLabel);
+        }
+
         int exitBlockDepth = -1;
         int profiled = -1;
         for (int idx = firstIndex; idx < endIndex; idx++) {
@@ -313,8 +326,24 @@ final class WasmAnalyzer {
                 }
             }
 
+            if (split != null && split.chainAt(idx) != null && split.chainAt(idx).ends[0] == idx) {
+                var chain = split.chainAt(idx);
+                nextLabel =
+                        callArms(result, functionType, body, chain, stack, nextLabel, callLabels);
+                idx = chain.ends[chain.arms()] - 1;
+                exitBlockDepth = body.instructions().get(chain.ends[chain.arms()]).depth();
+                continue;
+            }
+
             if (labels.contains(idx)) {
                 result.add(new CompilerInstruction(CompilerOpCode.LABEL, idx));
+            }
+
+            if (segment != null && segment.isArms() && segment.chain.isArmEnd(idx)) {
+                // the end of a chain block opened outside the segment: the next arm starts here
+                exitBlockDepth = -1;
+                stack.resetEmpty();
+                continue;
             }
 
             if (split != null && exitBlockDepth < 0 && split.segmentAt(idx) != null) {
@@ -435,6 +464,19 @@ final class WasmAnalyzer {
                 case BR_TABLE:
                     exitBlockDepth = ins.depth();
                     stack.pop(ValType.I32);
+                    if (split != null && split.chainAt(idx) != null) {
+                        nextLabel =
+                                dispatchArms(
+                                        result,
+                                        functionType,
+                                        body,
+                                        ins,
+                                        split.chainAt(idx),
+                                        stack,
+                                        nextLabel,
+                                        callLabels);
+                        break;
+                    }
                     // convert to jump if it only has a default
                     if (ins.labelTable().size() == 1) {
                         result.add(new CompilerInstruction(CompilerOpCode.DROP, ValType.I32.id()));
@@ -865,7 +907,11 @@ final class WasmAnalyzer {
         }
 
         if (segment != null) {
-            if (exitBlockDepth < 0) {
+            if (exitBlockDepth < 0 && segment.isArms()) {
+                // the last arm falls through into the next segment's first arm
+                int next = segment.chain.ends[segment.endArm];
+                result.add(new CompilerInstruction(CompilerOpCode.GOTO, next));
+            } else if (exitBlockDepth < 0) {
                 result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_EXIT, 0));
             }
             var rewritten = segmentExits(result, functionType, body, segment);
@@ -901,8 +947,18 @@ final class WasmAnalyzer {
             MethodSplit.Segment segment,
             TypeStack stack,
             int nextLabel) {
-        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_CALL, segment.index));
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_CALL, segment.index, 0));
+        return segmentExitDispatch(result, functionType, body, segment, stack, nextLabel);
+    }
 
+    /** Branches on the exit code a segment call left on the stack. */
+    private int segmentExitDispatch(
+            List<CompilerInstruction> result,
+            FunctionType functionType,
+            FunctionBody body,
+            MethodSplit.Segment segment,
+            TypeStack stack,
+            int nextLabel) {
         var exits = segment.exits;
         int after = nextLabel++;
         long[] table = new long[exits.size() + 2];
@@ -937,6 +993,204 @@ final class WasmAnalyzer {
         result.add(new CompilerInstruction(CompilerOpCode.LABEL, after));
         if (!segment.fallsThrough) {
             result.add(new CompilerInstruction(CompilerOpCode.TRAP));
+        }
+        return nextLabel;
+    }
+
+    /** Opens an arm segment: its entry code is the arm to start at. */
+    private int enterArms(
+            List<CompilerInstruction> result, MethodSplit.Segment segment, int nextLabel) {
+        var chain = segment.chain;
+        int first = segment.firstArm;
+        long[] arms = new long[segment.endArm - first + 1];
+        for (int arm = first; arm < segment.endArm; arm++) {
+            arms[arm - first] = chain.ends[arm];
+        }
+        arms[arms.length - 1] = chain.ends[first];
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_ENTRY));
+        result.add(new CompilerInstruction(CompilerOpCode.I32_CONST, first));
+        result.add(new CompilerInstruction(CompilerOpCode.I32_SUB));
+        result.add(new CompilerInstruction(CompilerOpCode.SWITCH, arms));
+        result.add(new CompilerInstruction(CompilerOpCode.LABEL, chain.ends[first]));
+        return nextLabel;
+    }
+
+    /**
+     * Replaces a chain's br_table in the root. A constant table maps each entry to its arm, or to
+     * a code past the arms for a target outside the chain; a binary search over the arm segments
+     * then calls the one holding the arm, and the other codes branch straight to their target.
+     */
+    private int dispatchArms(
+            List<CompilerInstruction> result,
+            FunctionType functionType,
+            FunctionBody body,
+            AnnotatedInstruction ins,
+            MethodSplit.Chain chain,
+            TypeStack stack,
+            int nextLabel,
+            Map<MethodSplit.Segment, Integer> callLabels) {
+        int size = chain.table.size() - 1;
+        int fallback = nextLabel++;
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH));
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH_LOAD));
+        result.add(new CompilerInstruction(CompilerOpCode.I32_CONST, size));
+        result.add(new CompilerInstruction(CompilerOpCode.I32_LT_U));
+        result.add(new CompilerInstruction(CompilerOpCode.IFEQ, fallback));
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH_LOAD));
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_ARM_OF, chain.index));
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH));
+
+        // leaves: each arm segment's arm range, then each target outside the chain
+        List<long[]> leaves = new ArrayList<>();
+        MethodSplit.Segment previous = null;
+        for (int arm = 0; arm < chain.arms(); arm++) {
+            var segment = chain.segmentOfArm[arm];
+            if (segment != previous) {
+                leaves.add(new long[] {segment.firstArm, segment.index});
+                previous = segment;
+            }
+        }
+        for (int i = 0; i < chain.outside.size(); i++) {
+            leaves.add(new long[] {chain.arms() + i, -1L - chain.outside.get(i)});
+        }
+        int[] labelsOut = {nextLabel};
+        dispatchLeaves(
+                result,
+                functionType,
+                body,
+                ins,
+                chain,
+                stack,
+                leaves,
+                0,
+                leaves.size() - 1,
+                labelsOut,
+                callLabels);
+
+        result.add(new CompilerInstruction(CompilerOpCode.LABEL, fallback));
+        int target = chain.table.get(size);
+        unwindStack(functionType, body, ins, target, stack).ifPresent(result::add);
+        result.add(new CompilerInstruction(CompilerOpCode.GOTO, target));
+        return labelsOut[0];
+    }
+
+    private void dispatchLeaves(
+            List<CompilerInstruction> result,
+            FunctionType functionType,
+            FunctionBody body,
+            AnnotatedInstruction ins,
+            MethodSplit.Chain chain,
+            TypeStack stack,
+            List<long[]> leaves,
+            int first,
+            int last,
+            int[] labelsOut,
+            Map<MethodSplit.Segment, Integer> callLabels) {
+        if (first < last) {
+            int middle = (first + last + 1) / 2;
+            int lower = labelsOut[0]++;
+            result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH_LOAD));
+            result.add(new CompilerInstruction(CompilerOpCode.I32_CONST, leaves.get(middle)[0]));
+            result.add(new CompilerInstruction(CompilerOpCode.I32_LT_U));
+            result.add(new CompilerInstruction(CompilerOpCode.IFNE, lower));
+            dispatchLeaves(
+                    result,
+                    functionType,
+                    body,
+                    ins,
+                    chain,
+                    stack,
+                    leaves,
+                    middle,
+                    last,
+                    labelsOut,
+                    callLabels);
+            result.add(new CompilerInstruction(CompilerOpCode.LABEL, lower));
+            dispatchLeaves(
+                    result,
+                    functionType,
+                    body,
+                    ins,
+                    chain,
+                    stack,
+                    leaves,
+                    first,
+                    middle - 1,
+                    labelsOut,
+                    callLabels);
+            return;
+        }
+        long key = leaves.get(first)[1];
+        if (key >= 0) {
+            var segment = chain.segmentOfArm[(int) leaves.get(first)[0]];
+            Integer call = callLabels.get(segment);
+            if (call == null) {
+                call = labelsOut[0]++;
+                callLabels.put(segment, call);
+            }
+            result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_STASH_LOAD));
+            result.add(new CompilerInstruction(CompilerOpCode.GOTO, call));
+            return;
+        }
+        int target = (int) (-1L - key);
+        unwindStack(functionType, body, ins, target, stack).ifPresent(result::add);
+        result.add(new CompilerInstruction(CompilerOpCode.GOTO, target));
+    }
+
+    /**
+     * Emits, where the chain's arms were, the calls of its arm segments: an entry stub for every
+     * arm some branch outside its segment starts, then each segment's call and exit branches.
+     */
+    private int callArms(
+            List<CompilerInstruction> result,
+            FunctionType functionType,
+            FunctionBody body,
+            MethodSplit.Chain chain,
+            TypeStack stack,
+            int nextLabel,
+            Map<MethodSplit.Segment, Integer> callLabels) {
+        for (int arm = 0; arm < chain.arms(); arm++) {
+            var end = body.instructions().get(chain.ends[arm]);
+            stack.scopeRestore();
+            stack.exitScope(end.scope());
+        }
+
+        Set<Integer> entered = new HashSet<>();
+        entered.add(chain.table.get(chain.table.size() - 1));
+        for (int arm = 0; arm < chain.arms(); arm++) {
+            for (var exit : chain.segmentOfArm[arm].exits) {
+                entered.add(exit.label);
+            }
+        }
+        for (int i = chain.outer; i < chain.dispatch; i++) {
+            var ins = body.instructions().get(i);
+            entered.add(ins.labelTrue());
+            entered.addAll(ins.labelTable());
+        }
+
+        MethodSplit.Segment previous = null;
+        for (int arm = 0; arm < chain.arms(); arm++) {
+            var segment = chain.segmentOfArm[arm];
+            if (segment == previous) {
+                continue;
+            }
+            previous = segment;
+            Integer call = callLabels.get(segment);
+            if (call == null) {
+                call = nextLabel++;
+                callLabels.put(segment, call);
+            }
+            for (int inner = segment.firstArm; inner < segment.endArm; inner++) {
+                if (!entered.contains(chain.ends[inner])) {
+                    continue;
+                }
+                result.add(new CompilerInstruction(CompilerOpCode.LABEL, chain.ends[inner]));
+                result.add(new CompilerInstruction(CompilerOpCode.I32_CONST, inner));
+                result.add(new CompilerInstruction(CompilerOpCode.GOTO, call));
+            }
+            result.add(new CompilerInstruction(CompilerOpCode.LABEL, call));
+            result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_CALL, segment.index, 1));
+            nextLabel = segmentExitDispatch(result, functionType, body, segment, stack, nextLabel);
         }
         return nextLabel;
     }

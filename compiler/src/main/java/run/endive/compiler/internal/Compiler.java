@@ -157,7 +157,13 @@ public final class Compiler {
     private static final int METHOD_SPLIT_BUDGET =
             Integer.getInteger("endive.methodSplitBudget", 0);
     private static final MethodType SEGMENT_METHOD_TYPE =
-            methodType(int.class, long[].class, Object[].class, Memory.class, Instance.class);
+            methodType(
+                    int.class,
+                    long[].class,
+                    Object[].class,
+                    Memory.class,
+                    Instance.class,
+                    int.class);
     // 1024*12 was empirically determined to work for the 50K small wasm functions.
     // So lets start there and halve it until we find a size that works.
     // This should give us the biggest class size possible.
@@ -2350,8 +2356,7 @@ public final class Compiler {
         Label rethrowStart = null;
         Label rethrowEnd = null;
         Label rethrowHandler = null;
-        boolean rethrowPending =
-                segment != null && segment.written.length > 0 && hasTryTable(ctx.getBody());
+        boolean rethrowPending = segment != null && segment.written.length > 0 && split.hasTryTable;
 
         // compile the function body
         for (CompilerInstruction ins : instructions) {
@@ -2384,14 +2389,39 @@ public final class Compiler {
                         emitFrameStore(ctx, (int) ins.operand(0), asm);
                         continue;
                     case SEGMENT_CALL:
+                        boolean entered = ins.operand(1) != 0;
+                        if (entered) {
+                            asm.store(ctx.scratchSlot(), INT_TYPE);
+                        }
                         asm.load(ctx.frameSlot(), OBJECT_TYPE);
                         asm.load(ctx.refFrameSlot(), OBJECT_TYPE);
                         asm.load(ctx.memorySlot(), OBJECT_TYPE);
                         asm.load(ctx.instanceSlot(), OBJECT_TYPE);
+                        if (entered) {
+                            asm.load(ctx.scratchSlot(), INT_TYPE);
+                        } else {
+                            asm.iconst(0);
+                        }
                         asm.invokestatic(
                                 classNameForFuncGroup(internalClassName, ctx.getId()),
                                 segmentMethodName(ctx.getId(), (int) ins.operand(0)),
                                 SEGMENT_METHOD_TYPE.toMethodDescriptorString(),
+                                false);
+                        continue;
+                    case SEGMENT_STASH:
+                        asm.store(ctx.scratchSlot(), INT_TYPE);
+                        continue;
+                    case SEGMENT_STASH_LOAD:
+                        asm.load(ctx.scratchSlot(), INT_TYPE);
+                        continue;
+                    case SEGMENT_ARM_OF:
+                        // arm = "<arm table>".charAt(entry)
+                        asm.visitLdcInsn(split.chains().get((int) ins.operand(0)).armTable());
+                        asm.swap();
+                        asm.invokevirtual(
+                                getInternalName(String.class),
+                                "charAt",
+                                getMethodDescriptor(Type.CHAR_TYPE, INT_TYPE),
                                 false);
                         continue;
                     case SEGMENT_RESULTS:
@@ -2405,6 +2435,9 @@ public final class Compiler {
                 }
             }
             switch (ins.opcode()) {
+                case SEGMENT_ENTRY:
+                    asm.load(ctx.entrySlot(), INT_TYPE);
+                    break;
                 case SEGMENT_EXIT:
                     {
                         for (int i = ins.operandCount() - 1; i >= 1; i--) {
@@ -2536,7 +2569,9 @@ public final class Compiler {
         if (limit <= 0 || moduleHasTailCalls || interpretedFunctions.contains(funcId)) {
             return null;
         }
-        if ((long) body.instructions().size() * 32 < limit) {
+        // compiled WASM runs at most about 4.3 bytes of bytecode per instruction (measured over
+        // AssemblyScript, C# NativeAOT and Luau modules): only measure what could pass the limit
+        if ((long) body.instructions().size() * 8 < limit) {
             return null;
         }
         int size =
@@ -2560,7 +2595,14 @@ public final class Compiler {
         for (int attempt = 0; attempt < attempts && budget >= 1; attempt++) {
             int minWeight = Math.max(1, Math.min(8, budget / 4));
             var planned =
-                    MethodSplit.plan(type, body, profile, budget, minWeight, analyzer::blockTypeOf);
+                    MethodSplit.plan(
+                            type,
+                            body,
+                            profile,
+                            budget,
+                            minWeight,
+                            limit / 16,
+                            analyzer::blockTypeOf);
             if (planned == null) {
                 break;
             }
@@ -2568,6 +2610,7 @@ public final class Compiler {
                 segment.analysis = analyzer.analyzeSegment(funcId, segment);
             }
             planned.rootAnalysis = analyzer.analyzeRoot(funcId, planned);
+            planned.hasTryTable = hasTryTable(body);
             split = planned;
             if (largestSegment(internalClassName, funcId, type, body, planned) <= limit) {
                 break;

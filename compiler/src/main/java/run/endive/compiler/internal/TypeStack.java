@@ -68,6 +68,12 @@ final class TypeStack {
         }
     }
 
+    /** Empties the stack, as at the start of a chain arm in an arm segment. */
+    public void resetEmpty() {
+        types.pop();
+        types.push(new ArrayDeque<>());
+    }
+
     public void pushTypes() {
         types.push(new ArrayDeque<>(types()));
     }

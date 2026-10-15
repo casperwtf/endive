@@ -298,4 +298,249 @@
       (local.set $t (i32.const 9))
       (return (local.get $t)))
     (local.get $t))
+
+  ;; a dispatch chain: a br_table into a nest of blocks with an arm after each block's end, like
+  ;; AssemblyScript's __visit_members; arms return, fall through, jump to later arms and loop
+  (func (export "chain") (param $n i32) (result i64)
+    (local $i i32) (local $j i32) (local $acc i64)
+    (local.set $acc (i64.const 1))
+    (block $exit
+      (loop $next
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br_if $exit (i32.gt_u (local.get $i) (local.get $n)))
+        (block $a40
+        (block $a39
+        (block $a38
+        (block $a37
+        (block $a36
+        (block $a35
+        (block $a34
+        (block $a33
+        (block $a32
+        (block $a31
+        (block $a30
+        (block $a29
+        (block $a28
+        (block $a27
+        (block $a26
+        (block $a25
+        (block $a24
+        (block $a23
+        (block $a22
+        (block $a21
+        (block $a20
+        (block $a19
+        (block $a18
+        (block $a17
+        (block $a16
+        (block $a15
+        (block $a14
+        (block $a13
+        (block $a12
+        (block $a11
+        (block $a10
+        (block $a9
+        (block $a8
+        (block $a7
+        (block $a6
+        (block $a5
+        (block $a4
+        (block $a3
+        (block $a2
+        (block $a1
+        (block $a0
+          (br_table $a9 $a3 $exit $a23 $a32 $a5 $a4 $a35 $a36 $next $a37 $a36 $a3 $a2 $a8 $a9 $a36 $a11 $next $a12 $a35 $a36 $exit $a34 $a20 $a29 $a15 $a15 $next $a31 $a28 $a4 $next $a21 $a31 $a4 $a36 $a20 $a22 $a37 $a4 $a17 $a4 $exit $a36 $a28 $a24 $a22 $exit $a10 $a31 $exit $a8 $a25 $a31 $next $a35 $a8 $a35 $a26 $a3
+            (i32.rem_u (i32.mul (local.get $i) (i32.const 13)) (i32.const 64))))
+          ;; arm 0
+          (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+          (br $next)
+        )
+          ;; arm 1
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 2
+          (if (i32.eq (local.get $i) (i32.const 2)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 1954)))
+          (br $next)
+        )
+          ;; arm 3
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a7)
+        )
+          ;; arm 4
+          (local.set $j (i32.const 0))
+          (loop $l4
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l4 (i32.lt_u (local.get $j) (i32.const 5))))
+          (br $next)
+        )
+          ;; arm 5
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 6
+          (local.set $acc (i64.add (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 7
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 8
+          (if (i32.eq (local.get $i) (i32.const 8)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 7816)))
+          (br $next)
+        )
+          ;; arm 9
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a13)
+        )
+          ;; arm 10
+          (local.set $j (i32.const 0))
+          (loop $l10
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l10 (i32.lt_u (local.get $j) (i32.const 1))))
+          (br $next)
+        )
+          ;; arm 11
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 12
+          (local.set $acc (i64.add (local.get $acc) (i64.const 13)))
+          (br $next)
+        )
+          ;; arm 13
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 14
+          (if (i32.eq (local.get $i) (i32.const 14)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 13678)))
+          (br $next)
+        )
+          ;; arm 15
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a19)
+        )
+          ;; arm 16
+          (local.set $j (i32.const 0))
+          (loop $l16
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l16 (i32.lt_u (local.get $j) (i32.const 2))))
+          (br $next)
+        )
+          ;; arm 17
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 18
+          (local.set $acc (i64.add (local.get $acc) (i64.const 19)))
+          (br $next)
+        )
+          ;; arm 19
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 20
+          (if (i32.eq (local.get $i) (i32.const 20)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 19540)))
+          (br $next)
+        )
+          ;; arm 21
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a25)
+        )
+          ;; arm 22
+          (local.set $j (i32.const 0))
+          (loop $l22
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l22 (i32.lt_u (local.get $j) (i32.const 3))))
+          (br $next)
+        )
+          ;; arm 23
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 24
+          (local.set $acc (i64.add (local.get $acc) (i64.const 25)))
+          (br $next)
+        )
+          ;; arm 25
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 26
+          (if (i32.eq (local.get $i) (i32.const 26)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 25402)))
+          (br $next)
+        )
+          ;; arm 27
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a31)
+        )
+          ;; arm 28
+          (local.set $j (i32.const 0))
+          (loop $l28
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l28 (i32.lt_u (local.get $j) (i32.const 4))))
+          (br $next)
+        )
+          ;; arm 29
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 30
+          (local.set $acc (i64.add (local.get $acc) (i64.const 31)))
+          (br $next)
+        )
+          ;; arm 31
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 32
+          (if (i32.eq (local.get $i) (i32.const 32)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 31264)))
+          (br $next)
+        )
+          ;; arm 33
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a37)
+        )
+          ;; arm 34
+          (local.set $j (i32.const 0))
+          (loop $l34
+            (local.set $acc (i64.add (local.get $acc) (i64.const 1)))
+            (local.set $j (i32.add (local.get $j) (i32.const 1)))
+            (br_if $l34 (i32.lt_u (local.get $j) (i32.const 5))))
+          (br $next)
+        )
+          ;; arm 35
+          (br_if $exit (i64.gt_u (local.get $acc) (i64.const 0x100000000000)))
+          (local.set $acc (i64.rotl (local.get $acc) (i64.const 7)))
+          (br $next)
+        )
+          ;; arm 36
+          (local.set $acc (i64.add (local.get $acc) (i64.const 37)))
+          (br $next)
+        )
+          ;; arm 37
+          (local.set $acc (i64.mul (local.get $acc) (i64.const 3)))
+        )
+          ;; arm 38
+          (if (i32.eq (local.get $i) (i32.const 38)) (then (return (i64.add (local.get $acc) (i64.const 100000)))))
+          (local.set $acc (i64.xor (local.get $acc) (i64.const 37126)))
+          (br $next)
+        )
+          ;; arm 39
+          (local.set $acc (i64.add (local.get $acc) (i64.extend_i32_u (local.get $i))))
+          (br $a40)
+        )
+        (br $next)))
+    (local.get $acc))
 )

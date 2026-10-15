@@ -328,6 +328,10 @@ enum CompilerOpCode {
     SEGMENT_CALL,
     SEGMENT_EXIT,
     SEGMENT_RESULTS,
+    SEGMENT_ENTRY,
+    SEGMENT_STASH,
+    SEGMENT_STASH_LOAD,
+    SEGMENT_ARM_OF,
     ;
 
     private final Optional<OpCode> opcode;

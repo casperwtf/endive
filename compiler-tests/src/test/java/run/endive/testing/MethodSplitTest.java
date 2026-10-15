@@ -52,7 +52,8 @@ public class MethodSplitTest {
         "carry",
         "funcrefDefault",
         "branches",
-        "unreachableTail"
+        "unreachableTail",
+        "chain"
     };
 
     @Test

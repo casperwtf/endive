@@ -4,7 +4,9 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.BitSet;
 import java.util.Deque;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
 import run.endive.wasm.types.AnnotatedInstruction;
 import run.endive.wasm.types.FunctionBody;
@@ -45,6 +47,76 @@ final class MethodSplit {
         }
     }
 
+    /**
+     * A dispatch chain: blocks {@code B_n ... B_0} each opening the next, the innermost ending in
+     * a wide {@code br_table}, and an arm of code after each block's end ({@code arm k} runs from
+     * the end of {@code B_k} to the end of {@code B_k+1}). Compilers emit it for a large switch;
+     * AssemblyScript's {@code __visit_members} is one with an arm per class. Its table alone can
+     * pass the JIT's limit, so the arms move into arm segments and the root dispatches into them.
+     */
+    static final class Chain {
+        /** The BLOCK opening the chain, B_n. */
+        final int outer;
+
+        /** The index of the br_table. */
+        final int dispatch;
+
+        /** {@code ends[k]} is the END of block B_k, the label arm k starts at; ends[n] closes it. */
+        final int[] ends;
+
+        /** The br_table entries, its default last. */
+        final List<Integer> table;
+
+        final Map<Integer, Integer> armOfLabel = new HashMap<>();
+
+        /** The targets of the table outside the chain's arms. */
+        final List<Integer> outside = new ArrayList<>();
+
+        Segment[] segmentOfArm;
+        int index;
+
+        Chain(int outer, int dispatch, int[] ends, List<Integer> table) {
+            this.outer = outer;
+            this.dispatch = dispatch;
+            this.ends = ends;
+            this.table = table;
+            for (int arm = 0; arm < ends.length - 1; arm++) {
+                armOfLabel.put(ends[arm], arm);
+            }
+            for (int i = 0; i < table.size() - 1; i++) {
+                int label = table.get(i);
+                if (!armOfLabel.containsKey(label) && !outside.contains(label)) {
+                    outside.add(label);
+                }
+            }
+        }
+
+        int arms() {
+            return ends.length - 1;
+        }
+
+        /**
+         * The arm of each table entry but the default, as the chars of a string the root loads as
+         * a constant; a target outside the arms is {@code arms() + its index in outside}.
+         */
+        String armTable() {
+            var chars = new StringBuilder();
+            for (int i = 0; i < table.size() - 1; i++) {
+                int label = table.get(i);
+                Integer arm = armOfLabel.get(label);
+                if (arm == null) {
+                    arm = arms() + outside.indexOf(label);
+                }
+                chars.append((char) arm.intValue());
+            }
+            return chars.toString();
+        }
+
+        boolean isArmEnd(int index) {
+            return armOfLabel.containsKey(index) && index != ends[0];
+        }
+    }
+
     static final class Segment {
         final int index;
         final int start;
@@ -55,6 +127,12 @@ final class MethodSplit {
         final int[] written;
         final List<Exit> exits = new ArrayList<>();
         WasmAnalyzer.AnalysisResult analysis;
+
+        /** For an arm segment: its chain and arms {@code [firstArm, endArm)}, else null. */
+        Chain chain;
+
+        int firstArm;
+        int endArm;
 
         Segment(
                 int index,
@@ -88,20 +166,36 @@ final class MethodSplit {
             if (label >= instructionCount) {
                 return true;
             }
+            if (chain != null) {
+                return chain.ends[firstArm] <= label && label < end;
+            }
             return start < label && label < end;
+        }
+
+        boolean isArms() {
+            return chain != null;
         }
     }
 
     private final List<Segment> segments;
+    private final List<Chain> chains;
     private final Segment[] byStart;
     WasmAnalyzer.AnalysisResult rootAnalysis;
+
+    /** Whether the function catches WASM exceptions, so segments must save locals unwinding. */
+    boolean hasTryTable;
+
     private final int localCount;
 
-    private MethodSplit(List<Segment> segments, int instructionCount, int localCount) {
+    private MethodSplit(
+            List<Segment> segments, List<Chain> chains, int instructionCount, int localCount) {
         this.segments = segments;
+        this.chains = chains;
         this.byStart = new Segment[instructionCount];
         for (Segment segment : segments) {
-            byStart[segment.start] = segment;
+            if (!segment.isArms()) {
+                byStart[segment.start] = segment;
+            }
         }
         this.localCount = localCount;
     }
@@ -112,6 +206,20 @@ final class MethodSplit {
 
     Segment segmentAt(int index) {
         return byStart[index];
+    }
+
+    /** The chain whose br_table or first arm label is at {@code index}, or null. */
+    Chain chainAt(int index) {
+        for (Chain chain : chains) {
+            if (chain.dispatch == index || chain.ends[0] == index) {
+                return chain;
+            }
+        }
+        return null;
+    }
+
+    List<Chain> chains() {
+        return chains;
     }
 
     int localCount() {
@@ -136,6 +244,8 @@ final class MethodSplit {
     // ===== planning =====
 
     private static final int DISPATCH_TABLE_SIZE = 16;
+    // the arm table is a string constant: at most 65535 bytes of modified UTF-8, 3 per char
+    private static final int MAX_CHAIN_ENTRIES = 65535 / 3;
 
     /**
      * Plans the segments of a function body.
@@ -151,15 +261,17 @@ final class MethodSplit {
             WasmAnalyzer.StackProfile profile,
             int budget,
             int minWeight,
+            int chainEntries,
             Function<Instruction, FunctionType> blockTypes) {
-        var planner = new Planner(body, profile, budget, minWeight, blockTypes);
+        var planner = new Planner(body, profile, budget, minWeight, chainEntries, blockTypes);
         int last = body.instructions().size() - 1;
         planner.planBody(0, last, 0);
         if (planner.segments.isEmpty()) {
             return null;
         }
         int localCount = type.params().size() + body.localTypes().size();
-        return new MethodSplit(planner.segments, body.instructions().size(), localCount);
+        return new MethodSplit(
+                planner.segments, planner.chains, body.instructions().size(), localCount);
     }
 
     static int weightOf(Instruction ins) {
@@ -183,7 +295,9 @@ final class MethodSplit {
         private final int[] lows;
         private final int budget;
         private final int minWeight;
+        private final int chainEntries;
         private final Function<Instruction, FunctionType> blockTypes;
+        private final List<Chain> chains = new ArrayList<>();
         private final int[] matchingEnd;
         private final int[] elseOf;
         private final long[] weightBefore;
@@ -194,8 +308,10 @@ final class MethodSplit {
                 WasmAnalyzer.StackProfile profile,
                 int budget,
                 int minWeight,
+                int chainEntries,
                 Function<Instruction, FunctionType> blockTypes) {
             this.instructions = body.instructions();
+            this.chainEntries = chainEntries;
             this.heights = profile.heights;
             this.lows = profile.lows;
             this.budget = budget;
@@ -285,7 +401,7 @@ final class MethodSplit {
                     continue;
                 }
                 int element = positions.get(at);
-                if (opensConstruct(element)) {
+                if (opensConstruct(element) && !planChain(element)) {
                     addBodies(element, bodies);
                 }
                 at++;
@@ -327,6 +443,104 @@ final class MethodSplit {
                 low = Math.min(low, lows[i]);
             }
             return low;
+        }
+
+        /** Splits the dispatch chain opened at {@code index} into arm segments, if it is one. */
+        private boolean planChain(int index) {
+            var chain = chainAt(index);
+            if (chain == null) {
+                return false;
+            }
+            int arms = chain.arms();
+            List<int[]> groups = new ArrayList<>();
+            int first = 0;
+            while (first < arms) {
+                int end = first;
+                while (end < arms && weight(chain.ends[first] + 1, chain.ends[end + 1]) <= budget) {
+                    end++;
+                }
+                if (end == first) {
+                    return false;
+                }
+                groups.add(new int[] {first, end});
+                first = end;
+            }
+            for (int i = chain.ends[0] + 1; i < chain.ends[arms]; i++) {
+                switch (instructions.get(i).opcode()) {
+                    case RETURN_CALL:
+                    case RETURN_CALL_INDIRECT:
+                    case RETURN_CALL_REF:
+                        return false;
+                    default:
+                        break;
+                }
+            }
+
+            chain.segmentOfArm = new Segment[arms];
+            for (int[] group : groups) {
+                int start = chain.ends[group[0]] + 1;
+                int end = chain.ends[group[1]];
+                var segment = segment(start, end, 0, false);
+                segment.chain = chain;
+                segment.firstArm = group[0];
+                segment.endArm = group[1];
+                for (int arm = group[0]; arm < group[1]; arm++) {
+                    chain.segmentOfArm[arm] = segment;
+                }
+                segments.add(segment);
+            }
+            chain.index = chains.size();
+            chains.add(chain);
+            return true;
+        }
+
+        private Chain chainAt(int index) {
+            List<Integer> blocks = new ArrayList<>();
+            int at = index;
+            while (instructions.get(at).opcode() == OpCode.BLOCK) {
+                var type = blockTypes.apply(instructions.get(at));
+                if (!type.params().isEmpty() || !type.returns().isEmpty()) {
+                    return null;
+                }
+                blocks.add(at);
+                at++;
+            }
+            if (blocks.size() < 2) {
+                return null;
+            }
+            int innermost = blocks.get(blocks.size() - 1);
+            int dispatch = matchingEnd[innermost] - 1;
+            var ins = instructions.get(dispatch);
+            if (ins.opcode() != OpCode.BR_TABLE
+                    || ins.labelTable().size() <= Math.max(DISPATCH_TABLE_SIZE, chainEntries)
+                    || ins.labelTable().size() > MAX_CHAIN_ENTRIES
+                    || heights[dispatch] != heights[index] + 1
+                    || heights[index] < 0) {
+                return null;
+            }
+            for (int label : ins.labelTable()) {
+                if (carriesValues(label, dispatch)) {
+                    return null;
+                }
+            }
+            int[] ends = new int[blocks.size()];
+            for (int k = 0; k < blocks.size(); k++) {
+                ends[k] = matchingEnd[blocks.get(blocks.size() - 1 - k)];
+            }
+            return new Chain(index, dispatch, ends, ins.labelTable());
+        }
+
+        /** Whether a branch from {@code from} to {@code label} carries values. */
+        private boolean carriesValues(int label, int from) {
+            if (label <= from) {
+                var loop = instructions.get(label - 1);
+                return !blockTypes.apply(loop).params().isEmpty();
+            }
+            var scope = instructions.get(label).scope();
+            if (scope.opcode() == OpCode.END) {
+                return true;
+            }
+            return !blockTypes.apply(scope).returns().isEmpty();
         }
 
         private void addBodies(int index, Deque<int[]> bodies) {
@@ -376,6 +590,10 @@ final class MethodSplit {
         }
 
         private void flush(int start, int end, int depth) {
+            segments.add(segment(start, end, depth, heights[end] >= 0));
+        }
+
+        private Segment segment(int start, int end, int depth, boolean fallsThrough) {
             BitSet read = new BitSet();
             BitSet written = new BitSet();
             for (int i = start; i < end; i++) {
@@ -394,16 +612,14 @@ final class MethodSplit {
             }
             BitSet loaded = (BitSet) read.clone();
             loaded.or(written);
-            boolean fallsThrough = heights[end] >= 0;
-            segments.add(
-                    new Segment(
-                            segments.size(),
-                            start,
-                            end,
-                            depth,
-                            fallsThrough,
-                            loaded.stream().toArray(),
-                            written.stream().toArray()));
+            return new Segment(
+                    segments.size(),
+                    start,
+                    end,
+                    depth,
+                    fallsThrough,
+                    loaded.stream().toArray(),
+                    written.stream().toArray());
         }
     }
 }

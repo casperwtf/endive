@@ -119,12 +119,13 @@ final class Context {
         int slot = 0;
 
         if (layout == Layout.SEGMENT) {
-            // static int segment(long[] frame, Object[] refFrame, Memory memory, Instance instance)
+            // static int segment(long[] frame, Object[] refFrame, Memory memory, Instance instance,
+            //                    int entry)
             this.frameSlot = 0;
             this.refFrameSlot = 1;
             this.memorySlot = 2;
             this.instanceSlot = 3;
-            slot = 4;
+            slot = 5;
             for (ValType param : type.params()) {
                 slots.add(slot);
                 slot += slotCount(param);
@@ -201,6 +202,11 @@ final class Context {
 
     public int scratchSlot() {
         return scratchSlot;
+    }
+
+    /** In a segment, the entry code its caller passed (which arm an arm segment starts at). */
+    public int entrySlot() {
+        return 4;
     }
 
     /** In a segment, holds the WASM exception unwinding through it while locals are saved. */
