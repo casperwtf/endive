@@ -70,6 +70,7 @@ import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.IntFunction;
 import java.util.function.Supplier;
+import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassTooLargeException;
 import org.objectweb.asm.ClassVisitor;
 import org.objectweb.asm.ClassWriter;
@@ -142,6 +143,27 @@ public final class Compiler {
             Integer.highestOneBit(
                     HUGE_METHOD_LIMIT / ESTIMATED_BYTES_PER_DISPATCH_ENTRY); // must be power of two
     private static final int MAX_CALL_INDIRECT_METHODS = 1024; // must be power of two
+    // A call_indirect dispatch costs about 12 bytes of bytecode per candidate function: keep each
+    // dispatch method under HugeMethodLimit so that the JIT compiles it.
+    private static final int MAX_CALL_INDIRECT_TARGETS = HUGE_METHOD_LIMIT / 16;
+    // A WASM function whose JVM bytecode exceeds this many bytes is split into several methods
+    // (see MethodSplit) so that HotSpot JIT compiles it: HotSpot never compiles a method over
+    // HugeMethodLimit (8000 bytes) and runs it in the bytecode interpreter. 0 disables splitting.
+    private static final int DEFAULT_METHOD_SPLIT_LIMIT =
+            Integer.getInteger("endive.methodSplitLimit", 7000);
+    private static final boolean METHOD_SPLIT_STRICT =
+            Boolean.getBoolean("endive.methodSplitStrict");
+    // Testing aid: a fixed segment budget (in weight units, see MethodSplit), used as is.
+    private static final int METHOD_SPLIT_BUDGET =
+            Integer.getInteger("endive.methodSplitBudget", 0);
+    private static final MethodType SEGMENT_METHOD_TYPE =
+            methodType(
+                    int.class,
+                    long[].class,
+                    Object[].class,
+                    Memory.class,
+                    Instance.class,
+                    int.class);
     // 1024*12 was empirically determined to work for the 50K small wasm functions.
     // So lets start there and halve it until we find a size that works.
     // This should give us the biggest class size possible.
@@ -158,11 +180,15 @@ public final class Compiler {
     private int maxFunctionsPerClass;
     private final HashSet<Integer> interpretedFunctions;
     private final Set<Integer> callRefTypeIds;
+    private final boolean[] checkedCallees;
     private final boolean[] tailCallFunctions;
     private final boolean[] tailCallTypes;
     private final boolean moduleHasTailCalls;
     private final boolean moduleHasObjectRefs;
     private final String[] methodNames;
+    private final int methodSplitLimit;
+    private final int methodSplitBudget;
+    private final Map<Integer, MethodSplit> splits = new HashMap<>();
     private boolean useBridgeClasses;
     private IntFunction<String> callIndirectClassResolver;
 
@@ -173,8 +199,12 @@ public final class Compiler {
             InterpreterFallback interpreterFallback,
             Set<Integer> interpretedFunctions,
             Supplier<ClassCollector> classCollectorFactory,
-            MethodPrefixer methodPrefixer) {
+            MethodPrefixer methodPrefixer,
+            int methodSplitLimit,
+            int methodSplitBudget) {
         this.className = requireNonNull(className, "className");
+        this.methodSplitLimit = methodSplitLimit;
+        this.methodSplitBudget = methodSplitBudget;
         this.module = requireNonNull(module, "module");
         this.analyzer = new WasmAnalyzer(module);
         this.functionImports = module.importSection().count(ExternalType.FUNCTION);
@@ -198,6 +228,7 @@ public final class Compiler {
 
         this.functionTypes = analyzer.functionTypes();
         this.callRefTypeIds = collectCallRefTypeIds();
+        this.checkedCallees = CallCycles.checkedCallees(module);
         this.tailCallFunctions = analyzer.tailCallFunctions();
         this.tailCallTypes = analyzer.tailCallTypes();
         this.moduleHasTailCalls = analyzer.hasTailCalls();
@@ -223,6 +254,10 @@ public final class Compiler {
      * function was compiled under that name.
      */
     private int funcIdForMethodName(String methodName) {
+        int segment = methodName.lastIndexOf('$');
+        if (segment > 0) {
+            methodName = methodName.substring(0, segment);
+        }
         for (int funcId = 0; funcId < methodNames.length; funcId++) {
             if (methodNames[funcId].equals(methodName)) {
                 return funcId;
@@ -257,6 +292,8 @@ public final class Compiler {
         private Set<Integer> interpretedFunctions;
         private Supplier<ClassCollector> classCollectorFactory;
         private MethodPrefixer methodPrefixer;
+        private int methodSplitLimit = DEFAULT_METHOD_SPLIT_LIMIT;
+        private int methodSplitBudget = METHOD_SPLIT_BUDGET;
 
         private Builder(WasmModule module) {
             this.module = module;
@@ -292,6 +329,20 @@ public final class Compiler {
             return this;
         }
 
+        public Builder withMethodSplitLimit(int methodSplitLimit) {
+            this.methodSplitLimit = methodSplitLimit;
+            return this;
+        }
+
+        /**
+         * Testing aid: plans every split with this fixed segment budget (in weight units, see
+         * {@link MethodSplit}) instead of one derived from the limit.
+         */
+        public Builder withMethodSplitBudget(int methodSplitBudget) {
+            this.methodSplitBudget = methodSplitBudget;
+            return this;
+        }
+
         public Compiler build() {
             var className = this.className;
             if (className == null) {
@@ -314,7 +365,9 @@ public final class Compiler {
                     interpreterFallback,
                     interpretedFunctions,
                     classCollectorFactory,
-                    methodPrefixer);
+                    methodPrefixer,
+                    methodSplitLimit,
+                    methodSplitBudget);
         }
     }
 
@@ -536,6 +589,7 @@ public final class Compiler {
                     } else {
                         body = module.codeSection().getFunctionBody(i - functionImports);
                         var bodyCopy = body;
+                        var split = splitFor(internalClassName, funcId, type, bodyCopy);
 
                         emitFunction(
                                 classWriter,
@@ -544,7 +598,31 @@ public final class Compiler {
                                 true,
                                 asm ->
                                         compileFunction(
-                                                internalClassName, funcId, type, bodyCopy, asm));
+                                                internalClassName,
+                                                funcId,
+                                                type,
+                                                bodyCopy,
+                                                asm,
+                                                split));
+
+                        if (split != null) {
+                            for (var segment : split.segments()) {
+                                emitFunction(
+                                        classWriter,
+                                        segmentMethodName(funcId, segment.index),
+                                        SEGMENT_METHOD_TYPE,
+                                        true,
+                                        asm ->
+                                                compileSegment(
+                                                        internalClassName,
+                                                        funcId,
+                                                        type,
+                                                        bodyCopy,
+                                                        split,
+                                                        segment,
+                                                        asm));
+                            }
+                        }
 
                         // call_xxx() bridges for boxed to native
                         emitFunction(
@@ -1705,7 +1783,7 @@ public final class Compiler {
         asm.load(instance, OBJECT_TYPE);
 
         // Can we fit the impl in a single method?
-        if (validIds.size() <= MAX_CALL_INDIRECT_METHODS) {
+        if (validIds.size() <= MAX_CALL_INDIRECT_TARGETS) {
 
             int[] keys = validIds.stream().mapToInt(x -> x).toArray();
             Label[] labels = validIds.stream().map(x -> new Label()).toArray(Label[]::new);
@@ -1734,30 +1812,40 @@ public final class Compiler {
                     rawMethodTypeFor(type)
                             .appendParameterTypes(Memory.class, Instance.class, int.class);
 
-            // Best value that worked with the 50K small wasm functions
+            // Best value that worked with the 50K small wasm functions, narrowed until no
+            // dispatch method has more candidates than the JIT compiles
             var maxCallIndirectMethods = MAX_CALL_INDIRECT_METHODS << 2;
+            while (maxCallIndirectMethods > 32
+                    && largestBucket(validIds, maxCallIndirectMethods)
+                            > MAX_CALL_INDIRECT_TARGETS) {
+                maxCallIndirectMethods = maxCallIndirectMethods >> 1;
+            }
             loadChunkedClass(
                     functionTypes.size(),
                     maxCallIndirectMethods,
-                    (collector, start, end, chunkSize) ->
-                            compileExtraClass(
-                                    collector,
-                                    classNameForCallIndirect(this.className, typeId, start),
-                                    (cw) -> {
-                                        emitFunction(
-                                                cw,
-                                                "apply",
-                                                applyParams,
-                                                true,
-                                                a ->
-                                                        compileCallIndirectApply(
-                                                                internalClassName,
-                                                                typeId,
-                                                                type,
-                                                                a,
-                                                                start,
-                                                                end));
-                                    }));
+                    (collector, start, end, chunkSize) -> {
+                        if (!hasIdIn(validIds, start, end)) {
+                            return;
+                        }
+                        compileExtraClass(
+                                collector,
+                                classNameForCallIndirect(this.className, typeId, start),
+                                (cw) -> {
+                                    emitFunction(
+                                            cw,
+                                            "apply",
+                                            applyParams,
+                                            true,
+                                            a ->
+                                                    compileCallIndirectApply(
+                                                            internalClassName,
+                                                            typeId,
+                                                            type,
+                                                            a,
+                                                            start,
+                                                            end));
+                                });
+                    });
 
             assert Integer.bitCount(maxCallIndirectMethods) == 1; // power of two
             int shift = Integer.numberOfTrailingZeros(maxCallIndirectMethods);
@@ -1777,6 +1865,11 @@ public final class Compiler {
             for (int i = 0; i < labels.length; i++) {
                 asm.mark(labels[i]);
                 asm.load(funcId, INT_TYPE);
+                if (!hasIdIn(validIds, i << shift, (i + 1) << shift)) {
+                    emitInvokeStatic(asm, THROW_UNKNOWN_FUNCTION);
+                    asm.athrow();
+                    continue;
+                }
                 asm.invokestatic(
                         classNameForCallIndirect(internalClassName, typeId, i << shift),
                         "apply",
@@ -1822,6 +1915,25 @@ public final class Compiler {
 
             emitUnboxResult(type, asm);
         }
+    }
+
+    private static int largestBucket(List<Integer> ids, int bucketSize) {
+        Map<Integer, Integer> counts = new HashMap<>();
+        int largest = 0;
+        for (int id : ids) {
+            int count = counts.merge(id / bucketSize, 1, Integer::sum);
+            largest = max(largest, count);
+        }
+        return largest;
+    }
+
+    private static boolean hasIdIn(List<Integer> ids, int start, int end) {
+        for (int id : ids) {
+            if (start <= id && id < end) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void compileCallIndirectApply(
@@ -2094,7 +2206,8 @@ public final class Compiler {
             int funcId,
             FunctionType type,
             FunctionBody body,
-            InstructionAdapter asm) {
+            InstructionAdapter asm,
+            MethodSplit split) {
 
         if (interpretedFunctions.contains(funcId)) {
 
@@ -2132,24 +2245,17 @@ public final class Compiler {
             return;
         }
 
-        var analysis = analyzer.analyze(funcId);
+        var analysis = split == null ? analyzer.analyze(funcId) : split.rootAnalysis;
         List<CompilerInstruction> instructions = analysis.instructions();
 
         var ctx =
-                new Context(
-                        module,
+                context(
                         internalClassName,
-                        maxFunctionsPerClass,
-                        analyzer.globalTypes(),
-                        functionTypes,
                         funcId,
                         type,
                         body,
-                        tailCallFunctions,
-                        tailCallTypes,
-                        useBridgeClasses ? callIndirectClassResolver : typeId -> internalClassName,
-                        analysis.maxTempSlots(),
-                        this::methodName);
+                        analysis,
+                        split == null ? Context.Layout.FUNCTION : Context.Layout.SPLIT_ROOT);
 
         int localsCount = type.params().size();
         if (hasTooManyParameters(type)) {
@@ -2171,6 +2277,12 @@ public final class Compiler {
             localsCount = 1;
         }
 
+        if (split != null) {
+            emitFrame(ctx, type, body, split, asm);
+            emitBody(ctx, internalClassName, instructions, split, null, asm);
+            return;
+        }
+
         // initialize local variables to their default values
         localsCount += body.localTypes().size();
         for (int i = type.params().size(); i < localsCount; i++) {
@@ -2185,6 +2297,41 @@ public final class Compiler {
             asm.store(ctx.localSlotIndex(i), asmType(localType));
         }
 
+        emitBody(ctx, internalClassName, instructions, null, null, asm);
+    }
+
+    private Context context(
+            String internalClassName,
+            int funcId,
+            FunctionType type,
+            FunctionBody body,
+            WasmAnalyzer.AnalysisResult analysis,
+            Context.Layout layout) {
+        return new Context(
+                module,
+                internalClassName,
+                maxFunctionsPerClass,
+                analyzer.globalTypes(),
+                functionTypes,
+                funcId,
+                type,
+                body,
+                tailCallFunctions,
+                tailCallTypes,
+                checkedCallees,
+                useBridgeClasses ? callIndirectClassResolver : typeId -> internalClassName,
+                analysis.maxTempSlots(),
+                this::methodName,
+                layout);
+    }
+
+    private void emitBody(
+            Context ctx,
+            String internalClassName,
+            List<CompilerInstruction> instructions,
+            MethodSplit split,
+            MethodSplit.Segment segment,
+            InstructionAdapter asm) {
         // allocate labels for all label targets
         Map<Long, Label> labels = new HashMap<>();
         for (var ins : instructions) {
@@ -2196,9 +2343,103 @@ public final class Compiler {
         // track targets to detect backward jumps
         Set<Long> visitedTargets = new HashSet<>();
 
+        // a segment writes back its locals when a WASM exception unwinds through it
+        Label rethrowStart = null;
+        Label rethrowEnd = null;
+        Label rethrowHandler = null;
+        boolean rethrowPending = segment != null && segment.written.length > 0 && split.hasTryTable;
+
         // compile the function body
         for (CompilerInstruction ins : instructions) {
+            if (rethrowPending && ins.opcode() != CompilerOpCode.TRY_CATCH_BLOCK) {
+                rethrowPending = false;
+                rethrowStart = new Label();
+                rethrowEnd = new Label();
+                rethrowHandler = new Label();
+                asm.visitTryCatchBlock(
+                        rethrowStart,
+                        rethrowEnd,
+                        rethrowHandler,
+                        getInternalName(WasmException.class));
+                asm.mark(rethrowStart);
+            }
+            if (ctx.layout() == Context.Layout.SPLIT_ROOT) {
+                switch (ins.opcode()) {
+                    case LOCAL_GET:
+                        emitFrameLoad(ctx, (int) ins.operand(0), asm);
+                        continue;
+                    case LOCAL_SET:
+                        emitFrameStore(ctx, (int) ins.operand(0), asm);
+                        continue;
+                    case LOCAL_TEE:
+                        if (slotCount(Emitters.valType(ins.operand(1), ctx)) == 1) {
+                            asm.dup();
+                        } else {
+                            asm.dup2();
+                        }
+                        emitFrameStore(ctx, (int) ins.operand(0), asm);
+                        continue;
+                    case SEGMENT_CALL:
+                        boolean entered = ins.operand(1) != 0;
+                        if (entered) {
+                            asm.store(ctx.scratchSlot(), INT_TYPE);
+                        }
+                        asm.load(ctx.frameSlot(), OBJECT_TYPE);
+                        asm.load(ctx.refFrameSlot(), OBJECT_TYPE);
+                        asm.load(ctx.memorySlot(), OBJECT_TYPE);
+                        asm.load(ctx.instanceSlot(), OBJECT_TYPE);
+                        if (entered) {
+                            asm.load(ctx.scratchSlot(), INT_TYPE);
+                        } else {
+                            asm.iconst(0);
+                        }
+                        asm.invokestatic(
+                                classNameForFuncGroup(internalClassName, ctx.getId()),
+                                segmentMethodName(ctx.getId(), (int) ins.operand(0)),
+                                SEGMENT_METHOD_TYPE.toMethodDescriptorString(),
+                                false);
+                        continue;
+                    case SEGMENT_STASH:
+                        asm.store(ctx.scratchSlot(), INT_TYPE);
+                        continue;
+                    case SEGMENT_STASH_LOAD:
+                        asm.load(ctx.scratchSlot(), INT_TYPE);
+                        continue;
+                    case SEGMENT_ARM_OF:
+                        // arm = "<arm table>".charAt(entry)
+                        asm.visitLdcInsn(split.chains().get((int) ins.operand(0)).armTable());
+                        asm.swap();
+                        asm.invokevirtual(
+                                getInternalName(String.class),
+                                "charAt",
+                                getMethodDescriptor(Type.CHAR_TYPE, INT_TYPE),
+                                false);
+                        continue;
+                    case SEGMENT_RESULTS:
+                        for (int i = 0; i < ins.operandCount(); i++) {
+                            var type = Emitters.valType(ins.operand(i), ctx);
+                            emitFrameLoad(ctx, split.localCount() + i, type, asm);
+                        }
+                        continue;
+                    default:
+                        break;
+                }
+            }
             switch (ins.opcode()) {
+                case SEGMENT_ENTRY:
+                    asm.load(ctx.entrySlot(), INT_TYPE);
+                    break;
+                case SEGMENT_EXIT:
+                    {
+                        for (int i = ins.operandCount() - 1; i >= 1; i--) {
+                            var type = Emitters.valType(ins.operand(i), ctx);
+                            emitFrameStore(ctx, split.localCount() + i - 1, type, asm);
+                        }
+                        emitWriteBack(ctx, segment, asm);
+                        asm.iconst((int) ins.operand(0));
+                        asm.areturn(INT_TYPE);
+                        break;
+                    }
                 case LABEL:
                     Label label = labels.get(ins.operand(0));
                     if (label != null) {
@@ -2257,5 +2498,317 @@ public final class Compiler {
                     emitter.emit(ctx, ins, asm);
             }
         }
+
+        if (rethrowStart != null) {
+            asm.mark(rethrowEnd);
+            asm.mark(rethrowHandler);
+            asm.store(ctx.unwindingSlot(), OBJECT_TYPE);
+            emitWriteBack(ctx, segment, asm);
+            asm.load(ctx.unwindingSlot(), OBJECT_TYPE);
+            asm.athrow();
+        }
+    }
+
+    // ===== method splitting, see MethodSplit =====
+
+    private static String segmentMethodName(String functionMethodName, int segment) {
+        return functionMethodName + "$" + segment;
+    }
+
+    private String segmentMethodName(int funcId, int segment) {
+        return segmentMethodName(methodName(funcId), segment);
+    }
+
+    private static boolean hasTryTable(FunctionBody body) {
+        for (var ins : body.instructions()) {
+            if (ins.opcode() == OpCode.TRY_TABLE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns how to split the function into several methods, or {@code null} when it compiles
+     * to a method small enough for the JIT, or cannot be split.
+     */
+    private MethodSplit splitFor(
+            String internalClassName, int funcId, FunctionType type, FunctionBody body) {
+        if (splits.containsKey(funcId)) {
+            return splits.get(funcId);
+        }
+        MethodSplit split = null;
+        try {
+            split = planSplit(internalClassName, funcId, type, body);
+        } catch (RuntimeException e) {
+            if (METHOD_SPLIT_STRICT) {
+                throw e;
+            }
+            System.err.println(
+                    "Warning: could not split the method of WASM function index "
+                            + funcId
+                            + ": "
+                            + e);
+        }
+        splits.put(funcId, split);
+        return split;
+    }
+
+    private MethodSplit planSplit(
+            String internalClassName, int funcId, FunctionType type, FunctionBody body) {
+        int limit = methodSplitLimit;
+        if (limit <= 0 || moduleHasTailCalls || interpretedFunctions.contains(funcId)) {
+            return null;
+        }
+        // compiled WASM runs at most about 4.3 bytes of bytecode per instruction (measured over
+        // AssemblyScript, C# NativeAOT and Luau modules): only measure what could pass the limit
+        if ((long) body.instructions().size() * 8 < limit) {
+            return null;
+        }
+        int size =
+                measure(
+                        methodName(funcId),
+                        methodTypeFor(type),
+                        asm -> compileFunction(internalClassName, funcId, type, body, asm, null));
+        if (size <= limit) {
+            return null;
+        }
+
+        double bytesPerWeight = (double) size / MethodSplit.totalWeight(body);
+        var profile = analyzer.stackProfile(funcId);
+        int budget = (int) (limit * 0.6 / bytesPerWeight);
+        int attempts = 4;
+        if (methodSplitBudget > 0) {
+            budget = methodSplitBudget;
+            attempts = 1;
+        }
+        MethodSplit split = null;
+        for (int attempt = 0; attempt < attempts && budget >= 1; attempt++) {
+            int minWeight = Math.max(1, Math.min(8, budget / 4));
+            var planned =
+                    MethodSplit.plan(
+                            type,
+                            body,
+                            profile,
+                            budget,
+                            minWeight,
+                            limit / 16,
+                            analyzer::blockTypeOf);
+            if (planned == null) {
+                break;
+            }
+            for (var segment : planned.segments()) {
+                segment.analysis = analyzer.analyzeSegment(funcId, segment);
+            }
+            planned.rootAnalysis = analyzer.analyzeRoot(funcId, planned);
+            planned.hasTryTable = hasTryTable(body);
+            split = planned;
+            if (largestSegment(internalClassName, funcId, type, body, planned) <= limit) {
+                break;
+            }
+            budget = budget / 2;
+        }
+        return split;
+    }
+
+    private int largestSegment(
+            String internalClassName,
+            int funcId,
+            FunctionType type,
+            FunctionBody body,
+            MethodSplit split) {
+        int largest = 0;
+        for (var segment : split.segments()) {
+            int size =
+                    measure(
+                            segmentMethodName(funcId, segment.index),
+                            SEGMENT_METHOD_TYPE,
+                            asm ->
+                                    compileSegment(
+                                            internalClassName,
+                                            funcId,
+                                            type,
+                                            body,
+                                            split,
+                                            segment,
+                                            asm));
+            largest = max(largest, size);
+        }
+        return largest;
+    }
+
+    /** The bytecode size of one method, emitted on its own without computing frames. */
+    private static int measure(
+            String methodName, MethodType methodType, Consumer<InstructionAdapter> consumer) {
+        var writer = new ClassWriter(0);
+        writer.visit(
+                Opcodes.V11,
+                Opcodes.ACC_PUBLIC | Opcodes.ACC_FINAL | Opcodes.ACC_SUPER,
+                "run/endive/$gen/Measure",
+                null,
+                getInternalName(Object.class),
+                null);
+        emitFunction(writer, methodName, methodType, true, consumer);
+        writer.visitEnd();
+        try {
+            return codeLength(writer.toByteArray());
+        } catch (MethodTooLargeException e) {
+            return e.getCodeSize();
+        }
+    }
+
+    /** Reads the code length of the only method of a class file. */
+    private static int codeLength(byte[] bytes) {
+        var reader = new ClassReader(bytes);
+        char[] buffer = new char[reader.getMaxStringLength()];
+        int offset = reader.header + 6;
+        offset += 2 + 2 * reader.readUnsignedShort(offset);
+        int fields = reader.readUnsignedShort(offset);
+        offset += 2;
+        for (int i = 0; i < fields; i++) {
+            offset = skipMember(reader, offset);
+        }
+        offset += 2; // methods count, which is one
+        offset += 6; // access, name, descriptor
+        int attributes = reader.readUnsignedShort(offset);
+        offset += 2;
+        for (int i = 0; i < attributes; i++) {
+            String name = reader.readUTF8(offset, buffer);
+            int length = reader.readInt(offset + 2);
+            if (name.equals("Code")) {
+                return reader.readInt(offset + 10);
+            }
+            offset += 6 + length;
+        }
+        return 0;
+    }
+
+    private static int skipMember(ClassReader reader, int offset) {
+        int attributes = reader.readUnsignedShort(offset + 6);
+        offset += 8;
+        for (int i = 0; i < attributes; i++) {
+            offset += 6 + reader.readInt(offset + 2);
+        }
+        return offset;
+    }
+
+    private static boolean needsRefFrame(FunctionType type, FunctionBody body, MethodSplit split) {
+        for (int i = 0; i < split.localCount(); i++) {
+            if (localType(type, body, i).isObjectRef()) {
+                return true;
+            }
+        }
+        for (var segment : split.segments()) {
+            for (var exit : segment.exits) {
+                for (var t : exit.types) {
+                    if (t.isObjectRef()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Allocates the frame of a split function and moves its arguments into it. */
+    private static void emitFrame(
+            Context ctx,
+            FunctionType type,
+            FunctionBody body,
+            MethodSplit split,
+            InstructionAdapter asm) {
+        int size = split.frameSize();
+        asm.iconst(size);
+        asm.newarray(LONG_TYPE);
+        asm.store(ctx.frameSlot(), OBJECT_TYPE);
+        if (needsRefFrame(type, body, split)) {
+            asm.iconst(size);
+            asm.newarray(OBJECT_TYPE);
+        } else {
+            asm.aconst(null);
+        }
+        asm.store(ctx.refFrameSlot(), OBJECT_TYPE);
+
+        for (int i = 0; i < type.params().size(); i++) {
+            var param = type.params().get(i);
+            asm.load(ctx.localSlotIndex(i), asmType(param));
+            emitFrameStore(ctx, i, param, asm);
+        }
+        for (int i = type.params().size(); i < split.localCount(); i++) {
+            var local = localType(type, body, i);
+            var defaultValue = defaultValue(local);
+            if (defaultValue instanceof Integer && ((Integer) defaultValue) != 0) {
+                asm.iconst((Integer) defaultValue);
+                emitFrameStore(ctx, i, local, asm);
+            }
+        }
+    }
+
+    private static void emitFrameLoad(Context ctx, int local, InstructionAdapter asm) {
+        emitFrameLoad(ctx, local, localType(ctx.getType(), ctx.getBody(), local), asm);
+    }
+
+    private static void emitFrameLoad(
+            Context ctx, int index, ValType type, InstructionAdapter asm) {
+        if (type.isObjectRef()) {
+            asm.load(ctx.refFrameSlot(), OBJECT_TYPE);
+            asm.iconst(index);
+            asm.aload(OBJECT_TYPE);
+            return;
+        }
+        asm.load(ctx.frameSlot(), OBJECT_TYPE);
+        asm.iconst(index);
+        asm.aload(LONG_TYPE);
+        emitLongToJvm(asm, type);
+    }
+
+    private static void emitFrameStore(Context ctx, int local, InstructionAdapter asm) {
+        emitFrameStore(ctx, local, localType(ctx.getType(), ctx.getBody(), local), asm);
+    }
+
+    /** Stores the value on top of the stack into the frame. */
+    private static void emitFrameStore(
+            Context ctx, int index, ValType type, InstructionAdapter asm) {
+        if (type.isObjectRef()) {
+            asm.store(ctx.scratchSlot(), OBJECT_TYPE);
+            asm.load(ctx.refFrameSlot(), OBJECT_TYPE);
+            asm.iconst(index);
+            asm.load(ctx.scratchSlot(), OBJECT_TYPE);
+            asm.astore(OBJECT_TYPE);
+            return;
+        }
+        emitJvmToLong(asm, type);
+        asm.store(ctx.scratchSlot(), LONG_TYPE);
+        asm.load(ctx.frameSlot(), OBJECT_TYPE);
+        asm.iconst(index);
+        asm.load(ctx.scratchSlot(), LONG_TYPE);
+        asm.astore(LONG_TYPE);
+    }
+
+    private static void emitWriteBack(
+            Context ctx, MethodSplit.Segment segment, InstructionAdapter asm) {
+        for (int local : segment.written) {
+            var type = localType(ctx.getType(), ctx.getBody(), local);
+            asm.load(ctx.localSlotIndex(local), asmType(type));
+            emitFrameStore(ctx, local, type, asm);
+        }
+    }
+
+    private void compileSegment(
+            String internalClassName,
+            int funcId,
+            FunctionType type,
+            FunctionBody body,
+            MethodSplit split,
+            MethodSplit.Segment segment,
+            InstructionAdapter asm) {
+        var analysis = segment.analysis;
+        var ctx = context(internalClassName, funcId, type, body, analysis, Context.Layout.SEGMENT);
+        for (int local : segment.loaded) {
+            var localType = localType(type, body, local);
+            emitFrameLoad(ctx, local, localType, asm);
+            asm.store(ctx.localSlotIndex(local), asmType(localType));
+        }
+        emitBody(ctx, internalClassName, analysis.instructions(), split, segment, asm);
     }
 }

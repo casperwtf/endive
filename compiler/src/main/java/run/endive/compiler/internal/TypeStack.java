@@ -22,6 +22,7 @@ final class TypeStack {
     private final Deque<Deque<ValType>> restore = new ArrayDeque<>();
     private final Map<Instruction, Integer> scopes = new HashMap<>();
     private final TypeSection typeSection;
+    private int low = Integer.MAX_VALUE;
 
     public TypeStack(TypeSection typeSection) {
         this.typeSection = typeSection;
@@ -36,8 +37,24 @@ final class TypeStack {
         types().push(type);
     }
 
+    /** Starts tracking the lowest stack height reached from now on. */
+    public void resetLow() {
+        low = types().size();
+    }
+
+    /** The lowest stack height reached since {@link #resetLow()}. */
+    public int low() {
+        return low;
+    }
+
+    /** Records that the top {@code count} values are used, as by a branch carrying them. */
+    public void touch(int count) {
+        low = Math.min(low, types().size() - count);
+    }
+
     public void pop(ValType expected) {
         var actual = types().pop();
+        low = Math.min(low, types().size());
         if (!ValType.matches(actual, expected, typeSection)) {
             throw new IllegalArgumentException("Expected type " + expected + " <> " + actual);
         }
@@ -45,9 +62,16 @@ final class TypeStack {
 
     public void popRef() {
         var actual = types().pop();
+        low = Math.min(low, types().size());
         if (!actual.isReference()) {
             throw new IllegalArgumentException("Expected reference type <> " + actual);
         }
+    }
+
+    /** Empties the stack, as at the start of a chain arm in an arm segment. */
+    public void resetEmpty() {
+        types.pop();
+        types.push(new ArrayDeque<>());
     }
 
     public void pushTypes() {
@@ -60,6 +84,8 @@ final class TypeStack {
 
     public void enterScope(Instruction scope, FunctionType scopeType) {
         scopes.put(scope, types().size());
+        // the block takes its parameters from the enclosing stack
+        low = Math.min(low, types().size() - scopeType.params().size());
 
         // restored stack when exiting "polymorphic" blocks after unconditional control transfer
         Deque<ValType> stack = new ArrayDeque<>(types());

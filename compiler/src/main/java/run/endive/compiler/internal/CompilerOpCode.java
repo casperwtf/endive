@@ -324,6 +324,14 @@ enum CompilerOpCode {
     BR_ON_NON_NULL_CHECK,
     BR_ON_CAST_CHECK,
     BR_ON_CAST_FAIL_CHECK,
+    // method splitting (no OpCode mapping), see MethodSplit
+    SEGMENT_CALL,
+    SEGMENT_EXIT,
+    SEGMENT_RESULTS,
+    SEGMENT_ENTRY,
+    SEGMENT_STASH,
+    SEGMENT_STASH_LOAD,
+    SEGMENT_ARM_OF,
     ;
 
     private final Optional<OpCode> opcode;

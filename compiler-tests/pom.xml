@@ -74,6 +74,11 @@
       <artifactId>wasm-corpus</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>run.endive</groupId>
+      <artifactId>wasm-tools</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
