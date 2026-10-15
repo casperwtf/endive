@@ -190,10 +190,6 @@ final class WasmAnalyzer {
         }
     }
 
-    public AnalysisResult analyze(int funcId) {
-        return analyze(funcId, null, null, null);
-    }
-
     /**
      * Returns the WASM operand stack around each instruction of the function.
      */
@@ -231,6 +227,10 @@ final class WasmAnalyzer {
 
     FunctionType blockTypeOf(Instruction ins) {
         return blockType(ins);
+    }
+
+    public AnalysisResult analyze(int funcId) {
+        return analyze(funcId, null, null, null);
     }
 
     @SuppressWarnings({"checkstyle:modifiedcontrolvariable", "checkstyle:MethodLength"})

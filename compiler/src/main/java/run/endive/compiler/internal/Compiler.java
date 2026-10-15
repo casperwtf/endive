@@ -2206,15 +2206,6 @@ public final class Compiler {
             int funcId,
             FunctionType type,
             FunctionBody body,
-            InstructionAdapter asm) {
-        compileFunction(internalClassName, funcId, type, body, asm, null);
-    }
-
-    private void compileFunction(
-            String internalClassName,
-            int funcId,
-            FunctionType type,
-            FunctionBody body,
             InstructionAdapter asm,
             MethodSplit split) {
 
