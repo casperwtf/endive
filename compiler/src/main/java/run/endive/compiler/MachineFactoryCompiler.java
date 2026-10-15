@@ -127,6 +127,17 @@ public final class MachineFactoryCompiler {
         }
 
         /**
+         * Sets the bytecode size above which a WASM function is split into several JVM methods,
+         * so that HotSpot JIT compiles it (it never compiles a method over its {@code
+         * HugeMethodLimit} of 8000 bytes). Defaults to the {@code endive.methodSplitLimit} system
+         * property, or 7000. Zero disables splitting.
+         */
+        public Builder withMethodSplitLimit(int methodSplitLimit) {
+            compilerBuilder.withMethodSplitLimit(methodSplitLimit);
+            return this;
+        }
+
+        /**
          * Drops the parsed instructions of every compiled function once compilation is done. The
          * module handed to instances keeps each function's local types, and the functions left to
          * the interpreter keep their instructions, but the compiled ones no longer hold their

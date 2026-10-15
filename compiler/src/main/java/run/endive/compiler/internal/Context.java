@@ -35,6 +35,20 @@ final class Context {
     private final int trySaveBaseSlot;
     private final IntFunction<String> callIndirectClassResolver;
     private final IntFunction<String> methodNames;
+    private final Layout layout;
+    private final int frameSlot;
+    private final int refFrameSlot;
+    private final int scratchSlot;
+
+    /** Where the WASM locals of the compiled method live, see {@link MethodSplit}. */
+    enum Layout {
+        /** A whole function: locals in JVM slots. */
+        FUNCTION,
+        /** The root of a split function: locals in the frame arrays. */
+        SPLIT_ROOT,
+        /** A segment of a split function: locals loaded from the frame into JVM slots. */
+        SEGMENT
+    }
 
     public Context(
             WasmModule module,
@@ -51,7 +65,42 @@ final class Context {
             IntFunction<String> callIndirectClassResolver,
             int maxTempSlots,
             IntFunction<String> methodNames) {
+        this(
+                module,
+                internalClassName,
+                maxFunctionsPerClass,
+                globalTypes,
+                functionTypes,
+                funcId,
+                type,
+                body,
+                tailCallFunctions,
+                tailCallTypes,
+                checkedCallees,
+                callIndirectClassResolver,
+                maxTempSlots,
+                methodNames,
+                Layout.FUNCTION);
+    }
+
+    public Context(
+            WasmModule module,
+            String internalClassName,
+            int maxFunctionsPerClass,
+            List<ValType> globalTypes,
+            List<FunctionType> functionTypes,
+            int funcId,
+            FunctionType type,
+            FunctionBody body,
+            boolean[] tailCallFunctions,
+            boolean[] tailCallTypes,
+            boolean[] checkedCallees,
+            IntFunction<String> callIndirectClassResolver,
+            int maxTempSlots,
+            IntFunction<String> methodNames,
+            Layout layout) {
         this.module = module;
+        this.layout = layout;
         this.internalClassName = internalClassName;
         this.maxFunctionsPerClass = maxFunctionsPerClass;
         this.globalTypes = globalTypes;
@@ -68,6 +117,29 @@ final class Context {
         // compute JVM slot indices for WASM locals
         List<Integer> slots = new ArrayList<>(type.params().size() + body.localTypes().size());
         int slot = 0;
+
+        if (layout == Layout.SEGMENT) {
+            // static int segment(long[] frame, Object[] refFrame, Memory memory, Instance instance)
+            this.frameSlot = 0;
+            this.refFrameSlot = 1;
+            this.memorySlot = 2;
+            this.instanceSlot = 3;
+            slot = 4;
+            for (ValType param : type.params()) {
+                slots.add(slot);
+                slot += slotCount(param);
+            }
+            for (ValType local : body.localTypes()) {
+                slots.add(slot);
+                slot += slotCount(local);
+            }
+            this.scratchSlot = slot;
+            slot += 3;
+            this.slots = List.copyOf(slots);
+            this.tempSlot = slot;
+            this.trySaveBaseSlot = slot + maxTempSlots;
+            return;
+        }
 
         // WASM arguments
         if (hasTooManyParameters(type)) {
@@ -99,9 +171,41 @@ final class Context {
             slot += slotCount(local);
         }
 
+        if (layout == Layout.SPLIT_ROOT) {
+            this.frameSlot = slot;
+            this.refFrameSlot = slot + 1;
+            this.scratchSlot = slot + 2;
+            slot += 4;
+        } else {
+            this.frameSlot = -1;
+            this.refFrameSlot = -1;
+            this.scratchSlot = -1;
+        }
+
         this.slots = List.copyOf(slots);
         this.tempSlot = slot;
         this.trySaveBaseSlot = slot + maxTempSlots;
+    }
+
+    public Layout layout() {
+        return layout;
+    }
+
+    public int frameSlot() {
+        return frameSlot;
+    }
+
+    public int refFrameSlot() {
+        return refFrameSlot;
+    }
+
+    public int scratchSlot() {
+        return scratchSlot;
+    }
+
+    /** In a segment, holds the WASM exception unwinding through it while locals are saved. */
+    public int unwindingSlot() {
+        return scratchSlot + 2;
     }
 
     public String internalClassName() {

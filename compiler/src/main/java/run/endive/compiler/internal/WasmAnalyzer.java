@@ -8,6 +8,7 @@ import static run.endive.compiler.internal.CompilerUtil.slotCount;
 import static run.endive.compiler.internal.TypeStack.FUNCTION_SCOPE;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -189,12 +190,58 @@ final class WasmAnalyzer {
         }
     }
 
-    @SuppressWarnings("checkstyle:modifiedcontrolvariable")
     public AnalysisResult analyze(int funcId) {
+        return analyze(funcId, null, null, null);
+    }
+
+    /**
+     * Returns the WASM operand stack around each instruction of the function.
+     */
+    StackProfile stackProfile(int funcId) {
+        var body = module.codeSection().getFunctionBody(funcId - functionImports);
+        var profile = new StackProfile(body.instructions().size());
+        analyze(funcId, null, null, profile);
+        return profile;
+    }
+
+    /** The WASM operand stack around each instruction of a function. */
+    static final class StackProfile {
+        /** The stack height before each instruction, or {@code -1} where it is unreachable. */
+        final int[] heights;
+
+        /** The lowest stack height each instruction pops down to. */
+        final int[] lows;
+
+        StackProfile(int size) {
+            this.heights = new int[size];
+            this.lows = new int[size];
+            Arrays.fill(lows, Integer.MAX_VALUE);
+        }
+    }
+
+    /** Analyzes the root of a split function, calling its segments. */
+    AnalysisResult analyzeRoot(int funcId, MethodSplit split) {
+        return analyze(funcId, split, null, null);
+    }
+
+    /** Analyzes one segment of a split function, filling in its exits. */
+    AnalysisResult analyzeSegment(int funcId, MethodSplit.Segment segment) {
+        return analyze(funcId, null, segment, null);
+    }
+
+    FunctionType blockTypeOf(Instruction ins) {
+        return blockType(ins);
+    }
+
+    @SuppressWarnings({"checkstyle:modifiedcontrolvariable", "checkstyle:MethodLength"})
+    private AnalysisResult analyze(
+            int funcId, MethodSplit split, MethodSplit.Segment segment, StackProfile profile) {
         var functionType = functionTypes.get(funcId);
         var body = module.codeSection().getFunctionBody(funcId - functionImports);
         var stack = new TypeStack(module.typeSection());
         int nextLabel = body.instructions().size();
+        int firstIndex = segment == null ? 0 : segment.start;
+        int endIndex = segment == null ? body.instructions().size() : segment.end;
         int trySaveSlotOffset = 0;
         List<CompilerInstruction> result = new ArrayList<>();
         // Collect TRY_CATCH_BLOCK instructions during the forward pass and
@@ -249,11 +296,35 @@ final class WasmAnalyzer {
         stack.enterScope(FUNCTION_SCOPE, FunctionType.of(List.of(), functionType.returns()));
 
         int exitBlockDepth = -1;
-        for (int idx = 0; idx < body.instructions().size(); idx++) {
+        int profiled = -1;
+        for (int idx = firstIndex; idx < endIndex; idx++) {
             AnnotatedInstruction ins = body.instructions().get(idx);
+
+            if (profile != null) {
+                if (profiled >= 0) {
+                    profile.lows[profiled] = stack.low();
+                }
+                profiled = -1;
+                profile.heights[idx] = -1;
+                if (exitBlockDepth < 0) {
+                    profile.heights[idx] = stack.types().size();
+                    stack.resetLow();
+                    profiled = idx;
+                }
+            }
 
             if (labels.contains(idx)) {
                 result.add(new CompilerInstruction(CompilerOpCode.LABEL, idx));
+            }
+
+            if (split != null && exitBlockDepth < 0 && split.segmentAt(idx) != null) {
+                var called = split.segmentAt(idx);
+                nextLabel = callSegment(result, functionType, body, called, stack, nextLabel);
+                idx = called.end - 1;
+                if (!called.fallsThrough) {
+                    exitBlockDepth = called.bodyDepth;
+                }
+                continue;
             }
 
             // skip instructions after unconditional control transfer
@@ -489,6 +560,10 @@ final class WasmAnalyzer {
 
                 case THROW:
                     {
+                        stack.touch(
+                                CompilerUtil.resolveTagType((int) ins.operand(0), module)
+                                        .params()
+                                        .size());
                         // Add the THROW instruction
                         result.add(
                                 new CompilerInstruction(
@@ -500,6 +575,7 @@ final class WasmAnalyzer {
                     }
                 case THROW_REF:
                     {
+                        stack.touch(1);
                         // Add instruction for THROW_REF
                         result.add(
                                 new CompilerInstruction(
@@ -784,13 +860,26 @@ final class WasmAnalyzer {
             }
         }
 
-        // implicit return at end of function
-        for (var type : reversed(functionType.returns())) {
-            stack.pop(type);
+        if (profile != null && profiled >= 0) {
+            profile.lows[profiled] = stack.low();
         }
-        result.add(new CompilerInstruction(CompilerOpCode.RETURN, ids(functionType.returns())));
 
-        stack.verifyEmpty();
+        if (segment != null) {
+            if (exitBlockDepth < 0) {
+                result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_EXIT, 0));
+            }
+            var rewritten = segmentExits(result, functionType, body, segment);
+            result.clear();
+            result.addAll(rewritten);
+        } else {
+            // implicit return at end of function
+            for (var type : reversed(functionType.returns())) {
+                stack.pop(type);
+            }
+            result.add(new CompilerInstruction(CompilerOpCode.RETURN, ids(functionType.returns())));
+
+            stack.verifyEmpty();
+        }
 
         // Prepend TRY_CATCH_BLOCK instructions in reverse order so that inner
         // (nested) handlers are registered before outer ones in the JVM.
@@ -799,6 +888,163 @@ final class WasmAnalyzer {
 
         return new AnalysisResult(
                 result, computeMaxTempSlots(result, EmitterMap.TEMP_SLOT_CALCULATORS));
+    }
+
+    /**
+     * Emits the call of a segment from the root and the branch its exit code selects: falling
+     * through, or the branch the segment took, carrying the values it left in the frame.
+     */
+    private int callSegment(
+            List<CompilerInstruction> result,
+            FunctionType functionType,
+            FunctionBody body,
+            MethodSplit.Segment segment,
+            TypeStack stack,
+            int nextLabel) {
+        result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_CALL, segment.index));
+
+        var exits = segment.exits;
+        int after = nextLabel++;
+        long[] table = new long[exits.size() + 2];
+        table[0] = after;
+        table[exits.size() + 1] = after;
+        for (int i = 0; i < exits.size(); i++) {
+            table[i + 1] = nextLabel++;
+        }
+        result.add(new CompilerInstruction(CompilerOpCode.SWITCH, table));
+
+        var from = body.instructions().get(segment.start);
+        for (int i = 0; i < exits.size(); i++) {
+            var exit = exits.get(i);
+            result.add(new CompilerInstruction(CompilerOpCode.LABEL, table[i + 1]));
+            result.add(new CompilerInstruction(CompilerOpCode.SEGMENT_RESULTS, ids(exit.types)));
+            if (exit.label == MethodSplit.RETURN_LABEL) {
+                result.add(
+                        new CompilerInstruction(
+                                CompilerOpCode.RETURN, ids(functionType.returns())));
+                continue;
+            }
+            for (var type : exit.types) {
+                stack.push(type);
+            }
+            unwindStack(functionType, body, from, exit.label, stack).ifPresent(result::add);
+            for (var type : reversed(exit.types)) {
+                stack.pop(type);
+            }
+            result.add(new CompilerInstruction(CompilerOpCode.GOTO, exit.label));
+        }
+
+        result.add(new CompilerInstruction(CompilerOpCode.LABEL, after));
+        if (!segment.fallsThrough) {
+            result.add(new CompilerInstruction(CompilerOpCode.TRAP));
+        }
+        return nextLabel;
+    }
+
+    /**
+     * Rewrites every branch leaving a segment, and every return, into a segment exit: a stub
+     * per branch site stores the values the branch carries and returns the exit code.
+     */
+    private List<CompilerInstruction> segmentExits(
+            List<CompilerInstruction> instructions,
+            FunctionType functionType,
+            FunctionBody body,
+            MethodSplit.Segment segment) {
+        int count = body.instructions().size();
+        var from = body.instructions().get(segment.start);
+        List<CompilerInstruction> result = new ArrayList<>(instructions.size());
+        List<CompilerInstruction> stubs = new ArrayList<>();
+        long stubLabel = 1L << 40;
+
+        for (var ins : instructions) {
+            switch (ins.opcode()) {
+                case GOTO:
+                case IFEQ:
+                case IFNE:
+                    {
+                        long target = ins.operand(0);
+                        if (segment.isInside(target, count)) {
+                            result.add(ins);
+                            break;
+                        }
+                        long stub = stubLabel++;
+                        result.add(new CompilerInstruction(ins.opcode(), stub));
+                        stubs.add(new CompilerInstruction(CompilerOpCode.LABEL, stub));
+                        stubs.add(exitTo(functionType, body, from, segment, (int) target));
+                        break;
+                    }
+                case SWITCH:
+                    {
+                        long[] targets = ins.operands().toArray();
+                        Map<Long, Long> stubFor = new HashMap<>();
+                        for (int i = 0; i < targets.length; i++) {
+                            long target = targets[i];
+                            if (segment.isInside(target, count)) {
+                                continue;
+                            }
+                            Long stub = stubFor.get(target);
+                            if (stub == null) {
+                                stub = stubLabel++;
+                                stubFor.put(target, stub);
+                                stubs.add(new CompilerInstruction(CompilerOpCode.LABEL, stub));
+                                stubs.add(exitTo(functionType, body, from, segment, (int) target));
+                            }
+                            targets[i] = stub;
+                        }
+                        result.add(new CompilerInstruction(CompilerOpCode.SWITCH, targets));
+                        break;
+                    }
+                case RETURN:
+                    {
+                        var types = functionType.returns();
+                        int code = segment.exitCode(MethodSplit.RETURN_LABEL, types);
+                        result.add(segmentExit(code, types));
+                        break;
+                    }
+                default:
+                    result.add(ins);
+            }
+        }
+        result.addAll(stubs);
+        return result;
+    }
+
+    private CompilerInstruction exitTo(
+            FunctionType functionType,
+            FunctionBody body,
+            AnnotatedInstruction from,
+            MethodSplit.Segment segment,
+            int label) {
+        var types = branchTypes(functionType, body, from, label);
+        return segmentExit(segment.exitCode(label, types), types);
+    }
+
+    private static CompilerInstruction segmentExit(int code, List<ValType> types) {
+        long[] operands = new long[types.size() + 1];
+        operands[0] = code;
+        for (int i = 0; i < types.size(); i++) {
+            operands[i + 1] = types.get(i).id();
+        }
+        return new CompilerInstruction(CompilerOpCode.SEGMENT_EXIT, operands);
+    }
+
+    /** The values a branch from {@code ins} to {@code label} carries, as in unwindStack. */
+    private List<ValType> branchTypes(
+            FunctionType functionType, FunctionBody body, AnnotatedInstruction ins, int label) {
+        boolean forward = true;
+        var target = body.instructions().get(label);
+        if (target.address() <= ins.address()) {
+            target = body.instructions().get(label - 1);
+            forward = false;
+        }
+        var scope = target.scope();
+        FunctionType blockType;
+        if (scope.opcode() == OpCode.END) {
+            blockType = functionType;
+        } else {
+            blockType = blockType(scope);
+        }
+        return forward ? blockType.returns() : blockType.params();
     }
 
     private int computeMaxTempSlots(
@@ -1630,6 +1876,7 @@ final class WasmAnalyzer {
 
         var types = forward ? blockType.returns() : blockType.params();
         int keep = types.size();
+        stack.touch(keep);
 
         // scope may have been exited already (unreachable code after unconditional branch)
         var scopeSize = stack.scopeStackSize(scope);
