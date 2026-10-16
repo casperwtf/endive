@@ -652,7 +652,7 @@ public final class Compiler {
     private byte[] compileClass() {
         var internalClassName = internalClassName(className);
 
-        ClassWriter binaryWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        ClassWriter binaryWriter = new FrameComputingClassWriter();
         ClassVisitor classWriter = shadedClassRemapper(binaryWriter, className);
 
         classWriter.visit(
@@ -1155,7 +1155,7 @@ public final class Compiler {
     }
 
     private void compileMachineCallClass() {
-        ClassWriter binaryWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        ClassWriter binaryWriter = new FrameComputingClassWriter();
         ClassVisitor classWriter = shadedClassRemapper(binaryWriter, className);
         String machineCallClassName = internalClassName(className + "MachineCall");
 
@@ -1247,7 +1247,7 @@ public final class Compiler {
 
     private void compileExtraClass(
             ClassCollector collector, String name, Consumer<ClassVisitor> consumer) {
-        ClassWriter binaryWriter = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        ClassWriter binaryWriter = new FrameComputingClassWriter();
         ClassVisitor classWriter = shadedClassRemapper(binaryWriter, className);
         String internalClassName = internalClassName(name);
         classWriter.visit(

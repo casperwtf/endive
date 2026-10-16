@@ -21,7 +21,7 @@ final class Shader {
 
     public static void createShadedClass(String className, ClassCollector collector) {
         String shadedClassName = internalClassName(className + "Shaded");
-        ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES);
+        ClassWriter writer = new FrameComputingClassWriter();
         ClassVisitor visitor = shadedClassRemapper(writer, className);
 
         visitor =
