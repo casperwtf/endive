@@ -32,7 +32,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     TRYCATCHBLOCK L0 L1 L2 run/endive/runtime/WasmException
    L0
     ILOAD 0
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
@@ -86,7 +85,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     TRYCATCHBLOCK L0 L1 L2 run/endive/runtime/WasmException
    L0
     ILOAD 0
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
@@ -132,7 +130,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ASTORE 3
    L3
     ILOAD 0
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
@@ -206,7 +203,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     TRYCATCHBLOCK L0 L1 L2 run/endive/runtime/WasmException
    L0
     ILOAD 0
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V

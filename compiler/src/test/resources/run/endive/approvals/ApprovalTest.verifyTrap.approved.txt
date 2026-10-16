@@ -124,7 +124,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ARETURN
 
   public static func_1(Lrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 0
     ALOAD 1
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (Lrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
@@ -138,7 +137,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ARETURN
 
   public static func_2(Lrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 0
     ALOAD 1
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_1 (Lrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)V

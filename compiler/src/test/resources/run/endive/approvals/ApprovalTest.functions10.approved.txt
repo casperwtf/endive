@@ -175,7 +175,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ILOAD 0
     ICONST_2
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_0 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -203,7 +202,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ILOAD 0
     ICONST_3
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_1 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -231,7 +229,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ILOAD 0
     ICONST_4
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_2 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -259,7 +256,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_0 {
     ILOAD 0
     ICONST_5
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_3 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -290,7 +286,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_1 {
     ILOAD 0
     BIPUSH 6
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_0.func_4 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -318,7 +313,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_1 {
     ILOAD 0
     BIPUSH 7
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_1.func_5 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -346,7 +340,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_1 {
     ILOAD 0
     BIPUSH 8
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_1.func_6 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -374,7 +367,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_1 {
     ILOAD 0
     BIPUSH 9
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_1.func_7 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
@@ -402,7 +394,6 @@ final class run/endive/$gen/CompiledMachineFuncGroup_1 {
     ILOAD 0
     BIPUSH 10
     IADD
-    INVOKESTATIC run/endive/$gen/CompiledMachineShaded.checkInterruption ()V
     ALOAD 1
     ALOAD 2
     INVOKESTATIC run/endive/$gen/CompiledMachineFuncGroup_1.func_8 (ILrun/endive/runtime/Memory;Lrun/endive/runtime/Instance;)I
